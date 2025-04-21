@@ -11,6 +11,10 @@ import * as os from 'os';
 import * as path from 'path';
 import * as crypto from 'crypto';
 
+// Import p-limit the CommonJS way - works with p-limit v3.1.0
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const pLimit = require('p-limit');
+
 // Constants for retry mechanism
 const MAX_RETRIES = 3;
 const INITIAL_BACKOFF_TIME = 1000; // 1 second
@@ -21,6 +25,7 @@ export class FileService {
   private readonly logger = new Logger(FileService.name);
   private readonly MAX_CONCURRENT_UPLOADS: number; // Will be set from env
   private readonly CHUNK_SIZE = 5 * 1024 * 1024; // 5MB chunks for large files
+  private readonly limit: any; // Store the p-limit instance
 
   constructor(
     private readonly prisma: PrismaService,
@@ -29,73 +34,88 @@ export class FileService {
   ) {
     // Get configuration values with defaults
     this.MAX_CONCURRENT_UPLOADS = parseInt(this.configService.get('MAX_CONCURRENT_UPLOADS', '3')); // 3 concurrent uploads default
+    this.limit = pLimit(this.MAX_CONCURRENT_UPLOADS);
   }
 
   async uploadFiles(fileUrls: string[]): Promise<File[]> {
-    const uploadedFiles: File[] = [];
-    const failedUploads: { url: string; reason: string }[] = [];
-    
-    // Instead of using p-limit for concurrency control, use Promise.all with slicing
-    const batchSize = this.MAX_CONCURRENT_UPLOADS;
-    const batches = [];
-    
-    // Start performance tracking
-    const startTime = Date.now();
-    this.logger.log(`Starting batch upload of ${fileUrls.length} files`);
-    
-    // Split URLs into batches of size MAX_CONCURRENT_UPLOADS
-    for (let i = 0; i < fileUrls.length; i += batchSize) {
-      const batch = fileUrls.slice(i, i + batchSize);
-      
-      // Process each batch
-      const batchPromise = Promise.all(
-        batch.map(url => 
-          this.uploadSingleFileWithRetry(url)
-            .then(file => {
-              uploadedFiles.push(file);
-              return file;
-            })
-            .catch(error => {
-              this.logger.error(`Failed to upload file from URL: ${url}`, error.stack);
-              failedUploads.push({ url, reason: error.message });
-              return null;
-            })
-        )
-      );
-      
-      batches.push(batchPromise);
-    }
-    
-    // Process batches sequentially
-    for (const batchPromise of batches) {
-      await batchPromise;
-    }
-    
-    // End performance tracking
-    const endTime = Date.now();
-    const totalTime = endTime - startTime;
-    const avgTimePerFile = uploadedFiles.length > 0 ? totalTime / uploadedFiles.length : 0;
-    
-    this.logger.log(`Batch upload completed. Success: ${uploadedFiles.length}, Failed: ${failedUploads.length}, Total time: ${totalTime}ms, Avg time per file: ${avgTimePerFile}ms`);
-    
-    if (failedUploads.length > 0 && uploadedFiles.length === 0) {
+    if (!fileUrls?.length) {
       throw new HttpException(
-        {
-          message: 'All file uploads failed',
-          failedUploads,
-        },
-        HttpStatus.BAD_REQUEST,
+        'No file URLs provided', 
+        HttpStatus.BAD_REQUEST
       );
     }
 
-    if (failedUploads.length > 0) {
-      this.logger.warn(`Some files failed to upload: ${JSON.stringify(failedUploads)}`);
-    }
+    // Before attempting uploads, validate all URLs and their file extensions
+    this.validateFileUrls(fileUrls);
 
-    return uploadedFiles;
+    // Process uploads in parallel with rate limiting
+    const uploadPromises = fileUrls.map(url => 
+      this.limit(() => this.processFileUpload(url))
+    );
+
+    try {
+      const uploadResults = await Promise.all(uploadPromises);
+      return uploadResults.filter(Boolean); // Filter out any null results
+    } catch (error) {
+      this.logger.error(`Failed to upload files: ${error.message}`, error.stack);
+      throw new HttpException(
+        `Failed to upload files: ${error.message}`,
+        HttpStatus.BAD_REQUEST
+      );
+    }
   }
 
-  private async uploadSingleFileWithRetry(url: string): Promise<File> {
+  /**
+   * Validates file URLs to ensure they have supported extensions
+   */
+  private validateFileUrls(fileUrls: string[]): void {
+    const invalidUrls: { url: string; reason: string }[] = [];
+
+    // Check each URL for validity and supported extension
+    fileUrls.forEach(url => {
+      try {
+        // Validate URL format
+        new URL(url);
+        
+        // Extract file name and extension
+        const fileName = this.extractFileNameFromUrl(url);
+        const fileExtension = path.extname(fileName).toLowerCase();
+        
+        // Check if extension exists and is supported
+        if (!fileExtension || fileExtension === '.') {
+          invalidUrls.push({
+            url,
+            reason: 'Missing file extension. Please provide a URL with a valid file extension.'
+          });
+        } else if (!['.jpg', '.jpeg', '.png', '.gif', '.pdf', '.doc', '.docx', 
+                   '.xls', '.xlsx', '.txt', '.csv', '.mp3', '.mp4', '.avi', 
+                   '.mov', '.zip', '.rar'].includes(fileExtension)) {
+          invalidUrls.push({
+            url,
+            reason: `File extension "${fileExtension}" is not supported.`
+          });
+        }
+      } catch (error) {
+        invalidUrls.push({
+          url,
+          reason: 'Invalid URL format'
+        });
+      }
+    });
+
+    // If any URLs are invalid, throw exception with details
+    if (invalidUrls.length > 0) {
+      throw new HttpException(
+        {
+          message: 'Invalid file URLs detected',
+          details: invalidUrls
+        },
+        HttpStatus.BAD_REQUEST
+      );
+    }
+  }
+
+  private async processFileUpload(fileUrl: string): Promise<File | null> {
     // Implement exponential backoff retry logic manually instead of using the library
     let attempt = 0;
     let delay = INITIAL_BACKOFF_TIME;
@@ -103,7 +123,7 @@ export class FileService {
 
     while (attempt < MAX_RETRIES) {
       try {
-        return await this.uploadSingleFile(url);
+        return await this.uploadSingleFile(fileUrl);
       } catch (error) {
         lastError = error;
         
@@ -120,7 +140,7 @@ export class FileService {
         attempt++;
         
         if (attempt < MAX_RETRIES) {
-          this.logger.warn(`Retrying upload (attempt ${attempt}/${MAX_RETRIES}) for URL: ${url}`);
+          this.logger.warn(`Retrying upload (attempt ${attempt}/${MAX_RETRIES}) for URL: ${fileUrl}`);
           
           // Wait for the backoff delay
           await new Promise(resolve => setTimeout(resolve, delay));

@@ -39,12 +39,40 @@ export class FileController {
     try {
       return await this.fileService.uploadFiles(uploadFilesDto.fileUrls);
     } catch (error) {
+      // Re-throw HttpExceptions as they already have status and message
       if (error instanceof HttpException) {
         throw error;
       }
+      
+      // Handle file extension errors specifically
+      if (error.message && error.message.includes('extension')) {
+        throw new HttpException(
+          {
+            status: HttpStatus.BAD_REQUEST,
+            error: error.message || 'Unsupported file extension',
+          },
+          HttpStatus.BAD_REQUEST
+        );
+      }
+      
+      // Handle URL format errors
+      if (error.message && (error.message.includes('URL') || error.message.includes('url'))) {
+        throw new HttpException(
+          {
+            status: HttpStatus.BAD_REQUEST,
+            error: error.message || 'Invalid URL format',
+          },
+          HttpStatus.BAD_REQUEST
+        );
+      }
+      
+      // Generic error handling with more descriptive message
       throw new HttpException(
-        'Failed to process upload request',
-        HttpStatus.INTERNAL_SERVER_ERROR
+        {
+          status: HttpStatus.BAD_REQUEST,
+          error: error.message || 'Failed to process upload request',
+        },
+        HttpStatus.BAD_REQUEST
       );
     }
   }
